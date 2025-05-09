@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { JwtService } from '@nestjs/jwt';
@@ -9,6 +9,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class WorkersService {
+  private readonly logger = new Logger(WorkersService.name);
+
   constructor(
     @InjectModel(Worker.name) private workerModel: Model<WorkerDocument>,
     private jwtService: JwtService,
@@ -16,14 +18,16 @@ export class WorkersService {
   ) {}
 
   async signup(signupDto: SignupDto) {
-    const { email, phoneNumber, password } = signupDto;
+    const { email, phone, password } = signupDto;
+    this.logger.debug(`Attempting to signup user with email: ${email} and phone: ${phone}`);
 
     // Check if user already exists
     const existingWorker = await this.workerModel.findOne({
-      $or: [{ email }, { phoneNumber }],
+      $or: [{ email }, { phoneNumber: phone }],
     });
 
     if (existingWorker) {
+      this.logger.debug(`User already exists with email: ${existingWorker.email} or phone: ${existingWorker.phoneNumber}`);
       throw new ConflictException('User with this email or phone number already exists');
     }
 
@@ -33,10 +37,12 @@ export class WorkersService {
     // Create new worker
     const worker = await this.workerModel.create({
       email,
-      phoneNumber,
+      phoneNumber: phone,
       password: hashedPassword,
       activeSessions: [],
     });
+
+    this.logger.debug(`Successfully created user with id: ${worker._id}`);
 
     // Generate JWT token
     const token = this.jwtService.sign({ sub: worker._id });
@@ -107,26 +113,49 @@ export class WorkersService {
       throw new BadRequestException('Either email or phone number is required');
     }
 
+    if (!otp) {
+      throw new BadRequestException('OTP is required');
+    }
+
+    if (!newPassword) {
+      throw new BadRequestException('New password is required');
+    }
+
     const worker = await this.workerModel.findOne({
       ...(email ? { email } : { phoneNumber }),
     });
 
-    if (!worker?.resetPasswordOtp || !worker?.resetPasswordOtpExpiry) {
-      throw new BadRequestException('Invalid or expired OTP');
+    if (!worker) {
+      throw new BadRequestException('User not found');
+    }
+
+    if (!worker.resetPasswordOtp) {
+      throw new BadRequestException('No password reset request found. Please request a password reset first.');
+    }
+
+    if (!worker.resetPasswordOtpExpiry) {
+      throw new BadRequestException('Password reset request has expired. Please request a new one.');
     }
 
     if (worker.resetPasswordOtpExpiry < new Date()) {
-      throw new BadRequestException('OTP has expired');
+      throw new BadRequestException('Password reset request has expired. Please request a new one.');
     }
 
-    if (!(await bcrypt.compare(otp, worker.resetPasswordOtp))) {
+    const isOtpValid = await bcrypt.compare(otp, worker.resetPasswordOtp);
+    if (!isOtpValid) {
       throw new UnauthorizedException('Invalid OTP');
     }
 
+    // Hash and update the new password
     worker.password = await bcrypt.hash(newPassword, 10);
+    
+    // Clear OTP fields
     worker.resetPasswordOtp = undefined;
     worker.resetPasswordOtpExpiry = undefined;
-    worker.activeSessions = []; // Logout from all devices
+    
+    // Clear all active sessions
+    worker.activeSessions = [];
+    
     await worker.save();
 
     return { message: 'Password reset successful' };
